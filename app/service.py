@@ -99,6 +99,24 @@
    全部通过才追加移交事件。拒绝（offer_rejected）、见证数不足
    （witness_threshold_not_met）、过期、链尾推进均为 409 且不写事件；
 5. 无见证邀约（不提交见证人）行为与上述普通邀约完全一致，向后兼容。
+
+Merkle 包含证明（可选择披露证明）
+--------------------------------
+- GET /chains/{chain_id}/events/{seq}/proof：在**同一个读事务**内读取该链
+  当前全部事件与链头 tail_hash（杜绝撕裂读），按 seq 升序以各 event_hash 为
+  叶子构造 Merkle 树，返回事件原文、自叶向根的左右方向兄弟路径、event_count、
+  tail_hash、merkle_root 与 snapshot_digest。链条不存在 404 not_found，
+  seq 越界（含负数）404 event_seq_out_of_range。
+- 叶子绑定 chain_id / seq / event_hash（SHA256("merkle-leaf:v1:" +
+  规范JSON({chain_id,event_hash,seq}))），不可跨链/跨序号挪用；内部节点固定
+  域分隔 SHA256("merkle-node:v1:" + left + right)，与叶子域不同；奇数层末
+  节点复制与自身配对（兄弟路径中 side=right、兄弟即自身）。
+- snapshot_digest = SHA256("merkle-snapshot:v1:" + 规范JSON({chain_id,
+  event_count, merkle_root, tail_hash}))，把出证时的事件集合与链尾绑定为
+  一个规范摘要。
+- POST /proofs/verify：仅依据请求体重算叶子、路径与 snapshot_digest，
+  **不读取数据库**；三阶段 structure -> merkle_root -> snapshot_digest，
+  返回 valid 与首个失败阶段 failed_stage。具体规则见 app/merkle.py。
 """
 from __future__ import annotations
 
@@ -109,6 +127,12 @@ from typing import Any, Optional
 
 from .database import read_tx, write_tx
 from .hashing import canonical_json, digest_hex
+from .merkle import (
+    build_inclusion_proof,
+    leaf_hash as merkle_leaf_hash,
+    snapshot_digest as merkle_snapshot_digest,
+    verify_event_proof as _verify_event_proof,
+)
 
 
 class ChainError(Exception):
@@ -1229,6 +1253,98 @@ def verify_chain(chain_id: str) -> dict[str, Any]:
         "recomputed_tail_hash": recomputed_tail,
         "stored_tail_hash": chain["tail_hash"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Merkle 包含证明（可选择披露证明）
+# ---------------------------------------------------------------------------
+
+def get_event_proof(chain_id: str, seq: int) -> dict[str, Any]:
+    """为指定事件生成「可选择披露」Merkle 包含证明。
+
+    事件集合与链尾快照必须在**同一个读事务**内取得，杜绝「按旧事件集合出
+    证、却给出新链尾」之类的撕裂读：事务内读取该链全部事件（按 seq 升序的
+    event_hash 为叶子）与 chains 行的 tail_hash，据此一次性生成兄弟路径、
+    Merkle 根与 snapshot_digest。
+
+    叶子绑定 chain_id / seq / event_hash（merkle-leaf:v1: 域），内部节点用
+    固定域分隔（merkle-node:v1:），奇数层末节点复制配对；snapshot_digest
+    按规范 JSON 绑定 {chain_id, event_count, merkle_root, tail_hash}
+    （merkle-snapshot:v1: 域）。
+
+    链条不存在返回 404 not_found；seq 越界（含负数）返回 404
+    event_seq_out_of_range。
+    """
+    # 路径参数在路由层为非负 int，这里再防御一次（负数直接 404）。
+    if seq < 0:
+        raise ChainError(
+            404, "event_seq_out_of_range", f"事件序号越界: {seq}"
+        )
+
+    with read_tx() as conn:
+        # 事件与链尾快照同一读事务内取出，二者必属同一时刻的链状态。
+        chain = conn.execute(
+            "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+        rows = conn.execute(
+            "SELECT * FROM events WHERE chain_id = ? ORDER BY seq", (chain_id,)
+        ).fetchall()
+
+        if seq >= len(rows):
+            raise ChainError(
+                404,
+                "event_seq_out_of_range",
+                f"事件序号越界: {seq}（该链当前共 {len(rows)} 个事件，"
+                f"合法区间 0～{len(rows) - 1}）",
+            )
+
+        leaves = [merkle_leaf_hash(chain_id, r["seq"], r["event_hash"]) for r in rows]
+        proof, root = build_inclusion_proof(leaves, seq)
+        event = _row_to_event(rows[seq])
+        tail_hash = chain["tail_hash"]
+        event_count = len(rows)
+        digest = merkle_snapshot_digest(chain_id, event_count, tail_hash, root)
+
+    return {
+        "chain_id": chain_id,
+        "event": event,
+        "proof": proof,
+        "event_count": event_count,
+        "tail_hash": tail_hash,
+        "merkle_root": root,
+        "snapshot_digest": digest,
+    }
+
+
+def verify_proof(
+    chain_id: Any,
+    seq: Any,
+    event_hash: Any,
+    event_count: Any,
+    tail_hash: Any,
+    merkle_root: Any,
+    snapshot_digest_value: Any,
+    siblings: Any,
+) -> dict[str, Any]:
+    """仅依据请求体重算叶子 / 兄弟路径 / 快照摘要并逐阶段校验。
+
+    **完全不读取数据库**：所有输入都来自请求体，三阶段（structure ->
+    merkle_root -> snapshot_digest）返回首个失败阶段。规则见
+    ``app.merkle.verify_event_proof``。
+    """
+    return _verify_event_proof(
+        chain_id=chain_id,
+        seq=seq,
+        event_hash=event_hash,
+        event_count=event_count,
+        tail_hash=tail_hash,
+        merkle_root=merkle_root,
+        snapshot_digest_value=snapshot_digest_value,
+        siblings=siblings,
+    )
 
 
 # ---------------------------------------------------------------------------

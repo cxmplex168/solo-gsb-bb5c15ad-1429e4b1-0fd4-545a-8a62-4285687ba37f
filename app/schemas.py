@@ -671,5 +671,108 @@ class SealOut(BaseModel):
     )
 
 
+class ProofSibling(BaseModel):
+    side: Literal["left", "right"] = Field(
+        ...,
+        description=(
+            "兄弟节点相对当前节点的位置：left 表示兄弟在左（父=H(兄弟,当前)），"
+            "right 表示兄弟在右（父=H(当前,兄弟)）；奇数层末节点复制配对时 "
+            "side=right 且兄弟即当前节点自身"
+        ),
+    )
+    sibling_hash: str = Field(
+        ..., description="兄弟节点哈希（64 位十六进制）"
+    )
+
+    @field_validator("sibling_hash")
+    @classmethod
+    def _check_sibling_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "sibling_hash")
+
+
+class EventProofOut(BaseModel):
+    chain_id: str
+    event: EventOut = Field(..., description="被披露的交接事件（序号、哈希与全部原文字段）")
+    proof: list[ProofSibling] = Field(
+        ..., description="自叶向根的兄弟路径（左右方向 + 兄弟哈希）"
+    )
+    event_count: int = Field(
+        ..., description="出证时该链的事件总数（Merkle 叶子数，含创世事件）"
+    )
+    tail_hash: str = Field(
+        ..., description="出证事务内读取到的当前链尾哈希（链尾快照）"
+    )
+    merkle_root: str = Field(
+        ...,
+        description=(
+            "当前事件集合（按 seq 升序的全部 event_hash）的 Merkle 根；"
+            "叶子绑定 chain_id/seq/event_hash，内部节点固定域分隔，"
+            "奇数层末节点复制配对"
+        ),
+    )
+    snapshot_digest: str = Field(
+        ...,
+        description=(
+            "按规范 JSON 对 {chain_id, event_count, merkle_root, tail_hash} "
+            "计算（带 merkle-snapshot:v1: 域分隔）的快照摘要，绑定出证时的"
+            "事件集合与链尾"
+        ),
+    )
+
+
+class ProofVerifyEvent(BaseModel):
+    # 仅提取校验所需字段：把出证响应原样回传时，事件对象的其余字段被忽略。
+    # seq 不加 ge=0：越界/负值属于语义校验，由 structure 阶段给出失败阶段，
+    # 而不是在模型层直接返回 422。
+    seq: int
+    event_hash: str
+
+
+class ProofVerifySibling(BaseModel):
+    # 故意不做十六进制/枚举强校验：非法值进入校验流程并返回首个失败阶段，
+    # 而不是在模型层直接 422（校验服务对请求体做完整自检，不读数据库）。
+    side: object
+    sibling_hash: object
+
+    model_config = {"extra": "ignore"}
+
+
+class ProofVerifyRequest(BaseModel):
+    chain_id: object
+    event: ProofVerifyEvent
+    proof: list[ProofVerifySibling]
+    event_count: object
+    tail_hash: object
+    merkle_root: object
+    snapshot_digest: object
+
+    # GET 出证响应可直接作为本接口请求体（忽略其中的额外字段）。
+    model_config = {"extra": "ignore"}
+
+
+class ProofVerifyResult(BaseModel):
+    valid: bool = Field(..., description="结构、Merkle 根与快照摘要三阶段是否全部通过")
+    failed_stage: Optional[
+        Literal["structure", "merkle_root", "snapshot_digest"]
+    ] = Field(
+        None,
+        description=(
+            "首个失败阶段：structure（字段形态/值域/路径长度）、"
+            "merkle_root（重算根不一致）、snapshot_digest（快照摘要不一致）；"
+            "valid=true 时为 null"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="失败原因；valid=true 时为 null")
+    computed_leaf_hash: Optional[str] = Field(
+        None, description="按请求体重算的叶子哈希（structure 阶段失败时可能为 null）"
+    )
+    computed_merkle_root: Optional[str] = Field(
+        None, description="按叶子与兄弟路径重算出的 Merkle 根（未走到该阶段时为 null）"
+    )
+    computed_snapshot_digest: Optional[str] = Field(
+        None, description="按请求体重算的快照摘要（未走到该阶段时为 null）"
+    )
+
+
 class HealthOut(BaseModel):
     status: str
