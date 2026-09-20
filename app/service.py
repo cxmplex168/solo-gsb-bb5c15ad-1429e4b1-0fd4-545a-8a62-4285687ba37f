@@ -99,6 +99,20 @@
    全部通过才追加移交事件。拒绝（offer_rejected）、见证数不足
    （witness_threshold_not_met）、过期、链尾推进均为 409 且不写事件；
 5. 无见证邀约（不提交见证人）行为与上述普通邀约完全一致，向后兼容。
+
+可选择披露证明（Merkle 包含证明）
+--------------------------------
+- GET /chains/{chain_id}/events/{seq}/proof：在**同一个读事务**内取齐该链
+  当前全部事件与当前链尾（同一快照），以各事件 event_hash 为叶构造 Merkle 树。
+  叶子绑定 chain_id / seq / event_hash（merkle.leaf_hash，域前缀
+  merkle-leaf:v1:）；内部节点用固定域分隔前缀 merkle-node:v1: 拼接左右定长
+  十六进制子摘要，奇数层末节点与自身复制配对；snapshot_digest 按 chain_id /
+  event_count / merkle_root / tail_hash 的规范 JSON 计算（域前缀
+  merkle-snapshot:v1:）。链条不存在 404 not_found；seq 越界（含负数）404
+  event_not_found。
+- POST /proofs/verify：**只依据请求体重算**叶子、兄弟路径与 snapshot_digest，
+  不读取数据库；请求体与证明响应同构，可原样回填。首个失败阶段按
+  event_count -> seq -> path -> merkle_root -> snapshot_digest 顺序返回。
 """
 from __future__ import annotations
 
@@ -109,6 +123,7 @@ from typing import Any, Optional
 
 from .database import read_tx, write_tx
 from .hashing import canonical_json, digest_hex
+from . import merkle
 
 
 class ChainError(Exception):
@@ -1228,6 +1243,130 @@ def verify_chain(chain_id: str) -> dict[str, Any]:
         "reason": reason,
         "recomputed_tail_hash": recomputed_tail,
         "stored_tail_hash": chain["tail_hash"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 交接事件的可选择披露证明（Merkle 包含证明）
+# ---------------------------------------------------------------------------
+
+
+def get_event_proof(chain_id: str, seq: int) -> dict[str, Any]:
+    """为指定事件生成 Merkle 包含证明。
+
+    事件集合与当前链尾必须在**同一个读事务**内取得，二者构成同一快照：
+    既避免事件数与 tail_hash 取自两个时刻，也使返回的 snapshot_digest 准确
+    锚定本次快照。链条不存在返回 404 not_found；seq 越界（负数或不小于
+    当前事件数）返回 404 event_not_found。
+
+    叶子绑定 chain_id / seq / event_hash（merkle.leaf_hash）；内部节点使用
+    固定域分隔前缀 merkle-node:v1: 拼接左右定长十六进制子哈希；奇数层末节点
+    与自身复制配对。snapshot_digest 按 chain_id / event_count / merkle_root /
+    tail_hash 的规范 JSON 计算。
+    """
+    with read_tx() as conn:
+        chain = conn.execute(
+            "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+        rows = conn.execute(
+            "SELECT * FROM events WHERE chain_id = ? ORDER BY seq", (chain_id,)
+        ).fetchall()
+
+    if not isinstance(seq, int) or seq < 0 or seq >= len(rows):
+        raise ChainError(
+            404,
+            "event_not_found",
+            f"事件序号越界: {seq}（该链当前共 {len(rows)} 个事件）",
+        )
+
+    event_hashes = [row["event_hash"] for row in rows]
+    proof = merkle.build_inclusion_proof(chain_id, event_hashes, seq)
+    snapshot = merkle.snapshot_digest(
+        chain_id=chain_id,
+        event_count=proof["event_count"],
+        tail_hash=chain["tail_hash"],
+        merkle_root=proof["merkle_root"],
+    )
+
+    return {
+        "chain_id": chain_id,
+        "event": _row_to_event(rows[seq]),
+        "leaf_hash": proof["leaf_hash"],
+        "path": proof["path"],
+        "event_count": proof["event_count"],
+        "tail_hash": chain["tail_hash"],
+        "merkle_root": proof["merkle_root"],
+        "snapshot_digest": snapshot,
+    }
+
+
+def verify_event_proof(
+    chain_id: str,
+    seq: int,
+    event_hash: str,
+    path: list[dict[str, str]],
+    event_count: int,
+    tail_hash: str,
+    merkle_root: str,
+    snapshot_digest_claim: str,
+) -> dict[str, Any]:
+    """仅依据请求体重算并校验 Merkle 包含证明，**不读取数据库**。
+
+    依次重算：叶子（绑定 chain_id/seq/event_hash）→ 按左右兄弟路径与「奇数层
+    末节点复制配对」规则重算 Merkle 根 → snapshot_digest。首个失败阶段即停止，
+    阶段顺序为 event_count → seq → path → merkle_root → snapshot_digest。
+    """
+    recomputed_leaf = merkle.leaf_hash(chain_id, seq, event_hash)
+    recomputed_snapshot = merkle.snapshot_digest(
+        chain_id=chain_id,
+        event_count=event_count,
+        tail_hash=tail_hash,
+        merkle_root=merkle_root,
+    )
+
+    root, failed_stage = merkle.evaluate_inclusion(
+        leaf=recomputed_leaf,
+        seq=seq,
+        path=[(step["direction"], step["sibling_hash"]) for step in path],
+        event_count=event_count,
+    )
+
+    reason: Optional[str] = None
+    if failed_stage is not None:
+        if failed_stage == merkle.STAGE_EVENT_COUNT:
+            reason = f"event_count 非法：{event_count}，必须为 >= 1 的整数"
+        elif failed_stage == merkle.STAGE_SEQ:
+            reason = f"seq 越界：{seq} 不在 [0, {event_count}) 范围内"
+        else:  # path
+            reason = (
+                "兄弟路径不合法：层数、左右方向或奇数层末节点复制配对规则"
+                "与 seq/event_count 不一致"
+            )
+    elif root != merkle_root:
+        failed_stage = merkle.STAGE_ROOT
+        reason = (
+            "Merkle 根不匹配：按请求体重算为 "
+            f"{root}，请求声明为 {merkle_root}"
+        )
+    elif recomputed_snapshot != snapshot_digest_claim:
+        failed_stage = merkle.STAGE_SNAPSHOT
+        reason = (
+            "链尾快照摘要不匹配：按 chain_id/event_count/merkle_root/"
+            f"tail_hash 重算为 {recomputed_snapshot}，"
+            f"请求声明为 {snapshot_digest_claim}"
+        )
+
+    return {
+        "valid": failed_stage is None,
+        "failed_stage": failed_stage,
+        "reason": reason,
+        "chain_id": chain_id,
+        "seq": seq,
+        "recomputed_leaf_hash": recomputed_leaf,
+        "recomputed_merkle_root": root,
+        "recomputed_snapshot_digest": recomputed_snapshot,
     }
 
 

@@ -131,6 +131,42 @@
      查询返回 **404**（`seal_not_found`）。
 - **完整性校验**：服务端从创世记录起逐条重算哈希、校验序号连续性与 `prev_hash`
   指针，并比对链尾缓存；校验结果给出 **首个断裂序号 `first_broken_seq`**。
+- **交接事件的可选择披露证明（Merkle 包含证明）**：无需公开整条链，即可向第三方
+  证明「某事件确实包含在该链当前事件集合中、且当时链尾为某值」：
+  1. **生成证明** `GET /chains/{chain_id}/events/{seq}/proof`：服务端在**同一个
+     读事务**内取齐该链当前全部事件与当前链尾（二者构成同一快照），以事件的
+     `event_hash` 为叶构造 Merkle 树。叶子**绑定 `chain_id`、`seq` 与
+     `event_hash`**：
+     ```
+     leaf = SHA256("merkle-leaf:v1:" + 规范JSON{"chain_id","event_hash","seq"})
+     ```
+     内部节点采用**固定域分隔前缀**，左右为定长 64 位十六进制子摘要直接拼接，
+     与叶子/快照分域，杜绝第二原像：
+     ```
+     node = SHA256("merkle-node:v1:" + left_hex + right_hex)
+     ```
+     **奇数层末节点与自身复制配对**（右兄弟即其自身，不引入其他填充值）；单
+     事件链的根即叶子，兄弟路径为空。响应返回：被证明事件 `event`、自叶子向根
+     的左右方向兄弟路径 `path`（每项 `{"direction","sibling_hash"}`，
+     `left` 表示先拼兄弟再拼当前节点）、事件数 `event_count`、同一快照下的
+     当前 `tail_hash`、`merkle_root`，以及按规范 JSON 计算的链尾快照摘要：
+     ```
+     snapshot_digest = SHA256("merkle-snapshot:v1:" + 规范JSON{
+         "chain_id","event_count","merkle_root","tail_hash"})
+     ```
+     链条不存在返回 **404**；`seq` 越界（负数或不小于当前事件数）返回 **404**
+     （`event_not_found`）。
+  2. **离线校验** `POST /proofs/verify`：**只依据请求体重算**叶子、兄弟路径与
+     `snapshot_digest`，**完全不读取数据库**，因此可在任何离线环境复算。请求体
+     与生成响应同构，可把证明响应**原样回填**；`event` 中仅 `seq`、`event_hash`
+     参与重算，其余字段被忽略。校验按 **`event_count` → `seq` → `path` →
+     `merkle_root` → `snapshot_digest`** 的顺序进行，响应给出 `valid` 与
+     **首个失败阶段 `failed_stage`**（成功为 `null`）及重算出的叶子/根/快照
+     摘要。篡改 `event_hash`、链 ID 或序号会在 `merkle_root` 阶段失败；篡改
+     `tail_hash`、`event_count` 或 `merkle_root` 会在 `snapshot_digest`（或
+     `merkle_root`）阶段失败；路径层数、左右方向或奇数层复制配对规则不一致在
+     `path` 阶段失败。注意：证明锚定的是「生成时刻的事件集合与链尾快照」，链继续
+     追加后旧证明仍然有效，只需重新生成即可获得新快照的证明。
 
 ## 一条命令启动（依赖安装 + 数据库初始化 + 启动）
 
@@ -186,6 +222,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/seals/{seal_id}` | 按封存 ID 查询状态（active / released / expired，不含解封码摘要） |
 | `GET`  | `/chains/{chain_id}/seal` | 查询某条链最新的封存（无封存 404 seal_not_found） |
 | `GET`  | `/chains/{chain_id}/verify` | 完整性校验，指出首个断裂序号 |
+| `GET`  | `/chains/{chain_id}/events/{seq}/proof` | 生成单个事件的 Merkle 包含证明（叶子绑定 chain_id/seq/event_hash；奇数层末节点复制配对；返回事件/左右兄弟路径/事件数/链尾/根/snapshot_digest；seq 越界 404 event_not_found） |
+| `POST` | `/proofs/verify` | 仅依据请求体重算叶子、路径与 snapshot_digest 离线校验，不读数据库；返回 valid 与首个失败阶段 |
 | `GET`  | `/health` | 健康检查 |
 
 错误响应统一为：`{"error": "<code>", "detail": "<说明>"}`。状态码约定：
@@ -216,7 +254,8 @@ cancelled / replaced / rejected / expired / terminated，或创建时未提供�
 `cancel_code_mismatch`（撤销码错误：撤销或原子替换时原撤销码不匹配）、
 `release_code_mismatch`（封存解封码错误）；
 **404** —— 链条、邀约、封存不存在，或对无见证邀约查询 `witness_mode_not_found`、
-对从未有过封存的链查询最新封存 `seal_not_found`。
+对从未有过封存的链查询最新封存 `seal_not_found`、查询 Merkle 证明时事件序号
+越界（含负数）`event_not_found`。
 
 ## 使用示例
 
@@ -478,6 +517,52 @@ curl -s -X POST http://localhost:8000/seals/3af2.../release \
 # 7) 链尾不是最新 -> 409 tail_mismatch（仅当前持有人可凭最新链尾封存）
 ```
 
+### Merkle 包含证明（可选择披露）示例
+
+```bash
+# 1) 为序号 1 的交接事件生成包含证明（事件与链尾在同一读事务快照取得）
+curl -s http://localhost:8000/chains/ab12.../events/1/proof
+# 200 响应（单事件链 path 为空、merkle_root 等于 leaf_hash）：
+# {
+#   "chain_id": "ab12...",
+#   "event": {"seq": 1, "event_hash": "6aae...", "giver": "alice",
+#             "receiver": "bob", "nonce": "n1", "prev_hash": "...", ...},
+#   "leaf_hash": "743d...",                       # 绑定 chain_id/seq/event_hash
+#   "path": [{"direction": "left", "sibling_hash": "a142..."}, ...],
+#   "event_count": 2,
+#   "tail_hash": "6aae...",                       # 同一快照下的当前链尾
+#   "merkle_root": "9112...",
+#   "snapshot_digest": "3a3d..."                  # 规范 JSON 快照摘要
+# }
+
+# 2) 离线校验：把证明响应原样回填即可（服务端不读数据库，只重算）
+curl -s -X POST http://localhost:8000/proofs/verify \
+  -H 'Content-Type: application/json' \
+  -d @proof.json
+# {"valid": true, "failed_stage": null, "reason": null,
+#  "chain_id": "ab12...", "seq": 1,
+#  "recomputed_leaf_hash": "743d...",
+#  "recomputed_merkle_root": "9112...",
+#  "recomputed_snapshot_digest": "3a3d..."}
+
+# 3) 篡改任一关键字段都会给出首个失败阶段（仍返回 200，valid=false）：
+#    event_hash / chain_id / seq 被改      -> failed_stage="merkle_root"
+#    tail_hash 被改（snapshot_digest 未改） -> failed_stage="snapshot_digest"
+#    path 少一层 / 左右方向颠倒             -> failed_stage="path"
+#    event_count <= 0                       -> failed_stage="event_count"
+#    seq 不在 [0, event_count)              -> failed_stage="seq"
+
+# 4) seq 越界 -> 404 event_not_found；链条不存在 -> 404 not_found
+curl -i http://localhost:8000/chains/ab12.../events/999/proof
+```
+
+哈希细节（三种固定域分隔，互不构成第二原像）：
+
+- 叶子：`SHA256("merkle-leaf:v1:" + sort_keys_json({"chain_id":…,"event_hash":…,"seq":…}))`
+- 内部节点：`SHA256("merkle-node:v1:" + left_hex + right_hex)`；奇数层末节点
+  与自身复制配对（路径中体现为 `direction="right"` 且 `sibling_hash` 为当前节点）
+- 快照：`SHA256("merkle-snapshot:v1:" + sort_keys_json({"chain_id":…,"event_count":…,"merkle_root":…,"tail_hash":…}))`
+
 校验响应示例（正常）：
 
 ```json
@@ -544,7 +629,8 @@ curl -s -X POST http://localhost:8000/seals/3af2.../release \
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
-│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验）
+│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验 / Merkle 包含证明生成与校验）
+│   ├── merkle.py      # Merkle 包含证明纯函数：叶子/内部节点/快照摘要、构造与离线重算（不读数据库）
 │   ├── database.py    # SQLite 连接、建表与旧 offers 表重建迁移、串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
 │   ├── schemas.py     # Pydantic 请求/响应模型

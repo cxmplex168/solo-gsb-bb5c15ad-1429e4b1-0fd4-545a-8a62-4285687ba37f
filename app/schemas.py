@@ -190,6 +190,166 @@ class VerifyResult(BaseModel):
     stored_tail_hash: Optional[str] = None
 
 
+class ProofPathStep(BaseModel):
+    direction: Literal["left", "right"] = Field(
+        ...,
+        description=(
+            "兄弟节点相对当前节点的方向：left 表示先拼兄弟哈希再拼当前哈希"
+            "（当前节点为右孩子），right 反之。奇数层末节点与自身复制配对时"
+            "为 right，且 sibling_hash 等于当前节点哈希。"
+        ),
+    )
+    sibling_hash: str = Field(
+        ...,
+        description=(
+            "该层兄弟节点哈希（64 位十六进制 Merkle 节点摘要）；路径自叶子向根"
+        ),
+    )
+
+    @field_validator("sibling_hash")
+    @classmethod
+    def _check_sibling_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "sibling_hash")
+
+
+class EventProofOut(BaseModel):
+    chain_id: str
+    event: EventOut = Field(..., description="被证明包含的交接事件（seq / event_hash 等）")
+    leaf_hash: str = Field(
+        ...,
+        description=(
+            "Merkle 叶子摘要：SHA256(\"merkle-leaf:v1:\" + 规范 JSON"
+            "{chain_id,event_hash,seq})，叶子绑定链、序号与事件哈希"
+        ),
+    )
+    path: list[ProofPathStep] = Field(
+        ...,
+        description=(
+            "自叶子向根的兄弟路径，每项给出兄弟哈希与左右方向；"
+            "单事件链为空列表。内部节点为 SHA256(\"merkle-node:v1:\"+左+右)，"
+            "奇数层末节点与自身复制配对"
+        ),
+    )
+    event_count: int = Field(
+        ..., description="生成证明时该链的事件总数（含创世记录）"
+    )
+    tail_hash: str = Field(
+        ..., description="同一读事务下该链的当前链尾哈希（事件集合与链尾为同一快照）"
+    )
+    merkle_root: str = Field(
+        ...,
+        description=(
+            "按当前事件集合计算的 Merkle 根；单事件链时即 leaf_hash"
+        ),
+    )
+    snapshot_digest: str = Field(
+        ...,
+        description=(
+            "链尾快照摘要：SHA256(\"merkle-snapshot:v1:\" + 规范 JSON"
+            "{chain_id,event_count,merkle_root,tail_hash})，把证明锚定到本次快照"
+        ),
+    )
+
+
+class ProofEventClaim(BaseModel):
+    """校验请求中的事件声明：校验端只信链 ID、序号与事件哈希并重算叶子。"""
+
+    seq: int = Field(..., description="被证明事件的序号（>= 0）")
+    event_hash: str = Field(..., description="被证明事件的 SHA-256 摘要（64 位十六进制）")
+
+    @field_validator("event_hash")
+    @classmethod
+    def _check_event_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "event_hash")
+
+    model_config = {"extra": "ignore"}
+
+
+class ProofVerifyRequest(BaseModel):
+    """POST /proofs/verify 请求体。
+
+    与 GET 证明响应同构，可将证明响应原样回填；服务端只依据本体重算叶子、
+    路径与 snapshot_digest，**不读取数据库**。event 中仅 seq、event_hash
+    参与重算，其余字段被忽略（服务端不据此信任事件内容）。
+    """
+
+    chain_id: str = Field(..., description="证明所属交接链 ID")
+    event: ProofEventClaim
+    leaf_hash: Optional[str] = Field(
+        None,
+        description=(
+            "仅为便于把证明响应原样回填而保留：服务端始终自行重算叶子，"
+            "该字段被忽略，不参与任何可信判定"
+        ),
+    )
+    path: list[ProofPathStep] = Field(..., description="待校验的兄弟路径（自叶子向根）")
+    event_count: int = Field(..., description="生成证明时声明的事件总数")
+    tail_hash: str = Field(..., description="生成证明时快照中的当前链尾哈希")
+    merkle_root: str = Field(..., description="生成证明时声明的 Merkle 根")
+    snapshot_digest: str = Field(
+        ..., description="生成证明时返回的链尾快照摘要，服务端自行重算后比对"
+    )
+
+    @field_validator("chain_id")
+    @classmethod
+    def _check_chain_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("chain_id 不能为空")
+        return v
+
+    @field_validator("tail_hash")
+    @classmethod
+    def _check_tail_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "tail_hash")
+
+    @field_validator("merkle_root")
+    @classmethod
+    def _check_merkle_root(cls, v: str) -> str:
+        return _validate_hex64(v, "merkle_root")
+
+    @field_validator("snapshot_digest")
+    @classmethod
+    def _check_snapshot_digest(cls, v: str) -> str:
+        return _validate_hex64(v, "snapshot_digest")
+
+    @field_validator("leaf_hash")
+    @classmethod
+    def _check_leaf_hash(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return _validate_hex64(v, "leaf_hash")
+
+
+class ProofVerifyResult(BaseModel):
+    valid: bool = Field(
+        ...,
+        description=(
+            "仅当叶子/路径重算根 == merkle_root 且 snapshot_digest 重算一致、"
+            "路径结构合法时为 true"
+        ),
+    )
+    failed_stage: Optional[Literal[
+        "event_count", "seq", "path", "merkle_root", "snapshot_digest"
+    ]] = Field(
+        None,
+        description=(
+            "首个失败阶段（按 event_count → seq → path → merkle_root → "
+            "snapshot_digest 顺序）；valid=true 时为 null"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="失败原因说明；成功为 null")
+    chain_id: str
+    seq: int
+    recomputed_leaf_hash: str = Field(..., description="按 chain_id/seq/event_hash 重算的叶子摘要")
+    recomputed_merkle_root: Optional[str] = Field(
+        None, description="按路径重算的 Merkle 根；路径结构非法时为 null"
+    )
+    recomputed_snapshot_digest: str = Field(
+        ..., description="按声明根/链尾/事件数重算的快照摘要（始终计算）"
+    )
+
+
 class WitnessInput(BaseModel):
     name: str = Field(..., description="见证人标识")
     token: str = Field(

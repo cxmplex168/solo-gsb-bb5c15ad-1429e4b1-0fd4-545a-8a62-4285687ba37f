@@ -11,6 +11,7 @@ from .schemas import (
     ChainOut,
     ChainSummary,
     CreateChainRequest,
+    EventProofOut,
     HandoverRequest,
     HandoverResult,
     HealthOut,
@@ -22,6 +23,8 @@ from .schemas import (
     OfferOut,
     OfferReplaceRequest,
     OfferStatusOut,
+    ProofVerifyRequest,
+    ProofVerifyResult,
     SealCreateRequest,
     SealOut,
     SealReleaseRequest,
@@ -39,6 +42,7 @@ from .service import (
     create_offer,
     create_seal,
     get_chain,
+    get_event_proof,
     get_latest_seal,
     get_offer,
     get_seal,
@@ -48,6 +52,7 @@ from .service import (
     release_seal,
     replace_offer,
     verify_chain,
+    verify_event_proof,
 )
 
 
@@ -61,7 +66,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -303,6 +308,57 @@ def api_get_chain(chain_id: str) -> ChainOut:
 )
 def api_verify_chain(chain_id: str) -> VerifyResult:
     return VerifyResult(**verify_chain(chain_id))
+
+
+@app.get(
+    "/chains/{chain_id}/events/{seq}/proof",
+    response_model=EventProofOut,
+    tags=["proofs"],
+    summary="生成单个交接事件的 Merkle 包含证明（可选择披露）",
+    description=(
+        "根据该链**当前事件集合**为序号 seq 的事件生成 Merkle 包含证明。叶子为"
+        ' SHA256("merkle-leaf:v1:" + 规范 JSON{chain_id,seq,event_hash})，'
+        '绑定链、序号与事件哈希；内部节点为 SHA256("merkle-node:v1:" + 左 + 右)'
+        "（左右均为定长 64 位十六进制），奇数层末节点与自身复制配对；单事件链"
+        "根即叶子。响应返回事件、自叶子向根的左右方向兄弟路径 path、事件数"
+        "event_count、同一读事务快照下的当前 tail_hash、merkle_root，以及"
+        ' SHA256("merkle-snapshot:v1:" + 规范 JSON'
+        "{chain_id,event_count,merkle_root,tail_hash}) 得到的 snapshot_digest。"
+        "事件与链尾在同一读事务内取得；链条不存在返回 404，seq 越界返回 "
+        "404 event_not_found。"
+    ),
+)
+def api_get_event_proof(chain_id: str, seq: int) -> EventProofOut:
+    return EventProofOut(**get_event_proof(chain_id, seq))
+
+
+@app.post(
+    "/proofs/verify",
+    response_model=ProofVerifyResult,
+    tags=["proofs"],
+    summary="离线校验 Merkle 包含证明（不读取数据库）",
+    description=(
+        "仅依据请求体重算叶子（chain_id/seq/event_hash）、左右兄弟路径与"
+        " snapshot_digest：按 event_count → seq → path → merkle_root → "
+        "snapshot_digest 的顺序给出首个失败阶段 failed_stage，全部通过 valid "
+        "才为 true。请求体与 GET 证明响应同构，可原样回填；event 中除 "
+        "seq、event_hash 外的字段被忽略。本接口不读取数据库，可在任何离线"
+        "环境复算。"
+    ),
+)
+def api_verify_proof(req: ProofVerifyRequest) -> ProofVerifyResult:
+    return ProofVerifyResult(
+        **verify_event_proof(
+            chain_id=req.chain_id,
+            seq=req.event.seq,
+            event_hash=req.event.event_hash,
+            path=[step.model_dump() for step in req.path],
+            event_count=req.event_count,
+            tail_hash=req.tail_hash,
+            merkle_root=req.merkle_root,
+            snapshot_digest_claim=req.snapshot_digest,
+        )
+    )
 
 
 @app.post(
